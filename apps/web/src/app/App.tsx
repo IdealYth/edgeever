@@ -175,9 +175,23 @@ const AuthenticatedWorkspace = ({ siteManagement = false }: { siteManagement?: b
   };
 
   const logoutMutation = useMutation({
-    mutationFn: api.logout,
-    onSuccess: () => {
-      clearCachedDesktopSession();
+    mutationFn: async () => {
+      // Stop AI drafts being generated before the session ends, so none is saved afterwards (#652).
+      const drafts = await import("@/lib/ai-body-draft-store");
+      drafts.cancelAiBodyDraftRuns();
+      return api.logout();
+    },
+    onSuccess: async () => {
+      // Unapplied AI drafts hold note text and results; remove this account's drafts on this instance.
+      const userId = sessionQuery.data?.user?.id;
+      if (userId) {
+        const [drafts, mirror, paths] = await Promise.all([
+          import("@/lib/ai-body-draft-store"), import("@/lib/local-mirror"), import("@/lib/app-page-path"),
+        ]);
+        await drafts.discardAiBodyDraftsForSignOut(
+          mirror.createLocalDataScope(paths.getPersistentDataScopeOrigin(window.location.origin), userId),
+        ).catch(() => undefined);
+      }
       queryClient.clear();
       queryClient.setQueryData<AuthSession>(["auth", "session"], {
         authRequired: true,
@@ -288,15 +302,22 @@ const AuthenticatedWorkspace = ({ siteManagement = false }: { siteManagement?: b
   }
 
   return (
-    <Suspense fallback={<AuthLoadingScreen />}>
-      {siteManagement ? <NotebookSiteManagementPage /> : <WorkspaceApp
-        authRequired={session.authRequired}
-        demoMode={session.demoMode}
-        isLoggingOut={logoutMutation.isPending}
-        user={session.user}
-        onLogout={() => logoutMutation.mutate()}
-      />}
-    </Suspense>
+    <>
+      {logoutMutation.isError && (
+        <div role="alert" className="fixed inset-x-4 top-4 z-50 rounded-lg border border-rose-200 bg-card p-4 text-sm text-rose-800 shadow-lg">
+          {t("session.logoutFailed")}
+        </div>
+      )}
+      <Suspense fallback={<AuthLoadingScreen />}>
+        {siteManagement ? <NotebookSiteManagementPage /> : <WorkspaceApp
+          authRequired={session.authRequired}
+          demoMode={session.demoMode}
+          isLoggingOut={logoutMutation.isPending}
+          user={session.user}
+          onLogout={() => logoutMutation.mutate()}
+        />}
+      </Suspense>
+    </>
   );
 };
 

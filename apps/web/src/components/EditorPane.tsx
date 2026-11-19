@@ -31,6 +31,7 @@ import {
   Copy,
   AppWindow,
   CopyPlus,
+  ClipboardType,
   Lock,
   LockOpen,
 } from "lucide-react";
@@ -51,8 +52,12 @@ import {
 } from "@/components/MemoEditorChromeDensity";
 import { MemoTitleInput } from "@/components/MemoTitleInput";
 import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
+  DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { EditorToolbar } from "./EditorToolbar";
 import { EditorOutline } from "./EditorOutline";
@@ -77,13 +82,14 @@ import {
   createResourceUploadPlaceholder,
   getImageUploadPlaceholderPosition,
   removeImageUploadPlaceholder,
-  waitForImageSourceReady,
   updateImageUploadPlaceholder,
 } from "./editor/image-upload-placeholder";
+import { registerImageUploadPreview, pruneImageUploadPreviews } from "./editor/image-upload-preview";
 import {
   clampResourceInsertionTarget,
   clearNodeSelectionAtDocumentEnd,
   getResourceInsertionTarget,
+  mapResourceInsertionTarget,
   shouldSelectInsertedResources,
 } from "@/lib/resource-insertion-target";
 import { insertUploadedResources } from "@/lib/resource-insertion";
@@ -96,15 +102,21 @@ import {
   createNoteLinkSuggestionExtension,
   type NoteLinkSuggestionLabels,
 } from "./editor/NoteLinkSuggestion";
-import { WeChatIcon } from "./WeChatIcon";
 import { useMarkdownTheme } from "./ThemeProvider";
+const EditorPhonePreview = lazy(() => import("./EditorPhonePreview").then((module) => ({ default: module.EditorPhonePreview })));
+
+const ShareNoteImageDialog = lazy(() => import("./dialogs/ShareNoteImageDialog").then((module) => ({ default: module.ShareNoteImageDialog })));
+
+const RevisionHistoryDialog = lazy(() => import("./dialogs/RevisionHistoryDialog").then((module) => ({ default: module.RevisionHistoryDialog })));
+
+const ShareMemoDialog = lazy(() => import("./dialogs/ShareMemoDialog").then((module) => ({ default: module.ShareMemoDialog })));
+
 const MarkdownSourceEditor = lazy(() =>
   import("./editor/MarkdownSourceEditor").then((module) => ({
     default: module.MarkdownSourceEditor,
   })),
 );
 import { sanitizeAndScopeCss } from "@/lib/css-sandbox";
-import { RevisionHistoryDialog } from "./dialogs/RevisionHistoryDialog";
 import { ExternalLinkDialog } from "./dialogs/ExternalLinkDialog";
 import { MathFormulaDialog } from "./dialogs/MathFormulaDialog";
 import { SpeechProviderReachabilityError } from "@/lib/speech-transcription-error";
@@ -115,13 +127,13 @@ import {
   selectedTextAsLatex,
   type MathFormulaDraft,
 } from "./editor/math-formula";
-import { memoShareQueryKey, ShareMemoDialog } from "./dialogs/ShareMemoDialog";
-import { ShareNoteImageDialog } from "./dialogs/ShareNoteImageDialog";
+import { memoShareQueryKey } from "@/lib/memo-share-query";
 import { AiSidebar, readAiSidebarOpen, readAiSidebarWidth, writeAiSidebarOpen } from "./ai-sidebar/AiSidebar";
 import { AiSidebarErrorBoundary } from "./ai-sidebar/AiSidebarErrorBoundary";
 import { api } from "@/lib/api";
 import { isDesktopResourceRuntime, stageDesktopResource, toDesktopResourceDownloadUrl, toDesktopResourceUrl } from "@/lib/desktop-resources";
 import { contentReferencesStagedResourceUrl, findMatchingMemoResource, repairMemoStagedResourceUrls, repairTiptapStagedResourceUrls } from "@/lib/staged-resource-repair";
+import { noteCoverTagCssVariables } from "@/lib/note-cover-tags";
 import { cn, parseTagsText } from "@/lib/utils";
 import {
   EDITOR_ARTICLE_ROW_GAP_PX,
@@ -176,6 +188,7 @@ import {
 } from "@/lib/memo-save-conflict";
 import { copyResourceToClipboard, copyTextToClipboard } from "@/lib/clipboard";
 import { useNoteProseStylePreference } from "@/lib/note-prose-style-preference";
+import { updateMemoReadingStyle, useMemoReadingStyle } from "@/lib/memo-reading-style";
 import { createClientUuid } from "@/lib/client-id";
 import { isLocalMemoId, remapLocalDraftMemoId } from "@/lib/local-mirror";
 import { shouldAcceptRemoteMemoDetail } from "@/lib/memo-detail-freshness";
@@ -196,7 +209,8 @@ import {
   type ShortcutSettings,
 } from "@/lib/app-helpers";
 import { ThemeBlock } from "./ThemeBlock";
-import { EditorPhonePreview, PhonePreviewGlyph } from "./EditorPhonePreview";
+import { PhonePreviewGlyph } from "./PhonePreviewGlyph";
+import { DeferredToolLoading } from "./DeferredToolLoading";
 import {
   applyHeadingLevelShortcut,
   applyPlainTextTab,
@@ -235,6 +249,7 @@ import {
   getRichTextAiSelectionContext,
   getRichTextAiSelectionReplacement,
 } from "@/lib/ai-selection-replacement";
+import { hashAiDraftSource, type AiDraftEditorApi, type AiDraftSelectionSnapshot } from "@/lib/ai-body-draft-store";
 import {
   AI_SELECTION_MENU_CHANGED_EVENT,
   readAiSelectionMenuPreference,
@@ -275,6 +290,7 @@ import { classifyEditorSaveFailure, shouldLeaveEditorAfterSaveError } from "./ed
 import { useEditorSaveConflictActions } from "./editor/useEditorSaveConflictActions";
 import { useEditorNoteSearchController } from "./editor/useEditorNoteSearchController";
 import { EditorNoteLinkPicker } from "./editor/EditorNoteLinkPicker";
+import { useBrowserImgBedFailure } from "./editor/useBrowserImgBedFailure";
 import { EditorResourceDialogs } from "./editor/EditorResourceDialogs";
 import { EditorNoteSearchBar } from "./editor/EditorNoteSearchBar";
 import { EditorSaveRecoveryBanner } from "./editor/EditorSaveRecoveryBanner";
@@ -313,7 +329,7 @@ import {
   getNoteLinkFromEventTarget,
   getNoteLinkHintPosition,
   getResourceFilesFromDataTransfer,
-  shouldInsertDroppedResourceFiles,
+  handleResourceFileDrop,
   isCreatedMemoEditorFocused,
   isEditorReady,
   releaseEditorMedia,
@@ -332,6 +348,8 @@ type EditorPaneProps = {
   onCreatePoster?: (memo: MemoDetail, text: string) => Promise<void>;
   memo: MemoDetail | null;
   repository: EdgeEverRepository;
+  /** `instance|user` scope of this device's local data; keeps unapplied AI drafts (#652 PR B). */
+  localDataScope: string;
   desktopFocusMode: boolean;
   onToggleDesktopFocusMode: () => void;
   noteProse: ResolvedNoteProse;
@@ -417,6 +435,7 @@ export const EditorPane = (props: EditorPaneProps) => {
 const RichEditorPane = ({
   memo,
   repository,
+  localDataScope,
   desktopFocusMode,
   onToggleDesktopFocusMode,
   noteProse,
@@ -499,6 +518,7 @@ const RichEditorPane = ({
   }, [memo?.id]);
   const [editorStateVersion, setEditorStateVersion] = useState(0);
   const [editorContentVersion, setEditorContentVersion] = useState(0);
+  const { chooseFailure: chooseImgBedFailure, failureDialog: imgBedFailureDialog } = useBrowserImgBedFailure(`${localDataScope}:${memo?.id ?? ""}`);
   const [imageUploadState, setImageUploadState] = useState<"idle" | "compressing" | "uploading" | "error">("idle");
   const [imagePreview, setImagePreview] = useState<ImagePreviewRequestDetail | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -665,6 +685,7 @@ const RichEditorPane = ({
     setEditorScrollContainer(element);
   }, []);
   const notebookOptions = useMemo(() => getNotebookMoveOptions(notebooks), [notebooks]);
+  const notebookName = notebookOptions.find((notebook) => notebook.id === memo?.notebookId)?.name;
   const readOnly = isTrashView || Boolean(memo?.isDeleted);
   const shareMemoId = memo && !readOnly && !isLocalMemoId(memo.id) ? memo.id : null;
   const shareStatusQuery = useQuery({
@@ -730,6 +751,8 @@ const RichEditorPane = ({
 
   const memoRef = useRef<MemoDetail | null>(memo);
   const noteProseStyle = useNoteProseStylePreference();
+  const { showMagazineCover, showChapterNavigation } = useMemoReadingStyle(localDataScope, memo?.id);
+  const [readingStyleSaveError, setReadingStyleSaveError] = useState<string | null>(null);
   const editSessionRef = useRef<MemoEditSession | null>(null);
   const editorRef = useRef<Editor | null>(null);
   const headingShortcutSurfaceRef = useRef({ markdown: false, plainText: false });
@@ -1051,7 +1074,9 @@ const RichEditorPane = ({
       const external = await uploadImageWithPicGo(uploadFile, {
         title: t(`${failure}.failedTitle`), message: t(`${failure}.failedMessage`),
         retry: t("settings.picgo.retry"), fallback: t("settings.picgo.fallback"), cancel: t("settings.picgo.cancel"),
-      }, { memoId: targetMemoId });
+      }, { memoId: targetMemoId, chooseFailure: chooseImgBedFailure,
+        isActive: () => memoRef.current?.id === targetMemoId && editorInstanceMemoIdentityRef.current.instanceKey === instanceKey,
+      });
       // PicGo or its failure dialog may outlive the original note/instance.
       if (memoRef.current?.id !== targetMemoId || editorInstanceMemoIdentityRef.current.instanceKey !== instanceKey) {
         throw new Error("The active note changed during image upload");
@@ -1088,7 +1113,7 @@ const RichEditorPane = ({
         url: `edgeever-staged://${staged.id}`,
       };
     }
-  }, [repository, t]);
+  }, [repository, t, chooseImgBedFailure]);
 
   const insertResourceFiles = useCallback((files: File[], dropPosition?: number) => {
     const currentMemo = memoRef.current;
@@ -1121,6 +1146,7 @@ const RichEditorPane = ({
 
     void resourceInsertionLimit(async () => {
       let resumeDesktopSync: (() => void) | null = null;
+      let stopTrackingInsertion: (() => void) | undefined;
       try {
         // A new desktop note can receive its durable ID while a file is being
         // staged. Keep the note ID and staged resource together until the
@@ -1135,9 +1161,13 @@ const RichEditorPane = ({
 
         // Read the selection only after earlier resource insertions complete.
         // Rapid consecutive pastes otherwise race with the same stale cursor.
-        const insertionTarget = dropPosition ?? getResourceInsertionTarget(insertionEditor.state.selection);
+        let insertionTarget = dropPosition ?? getResourceInsertionTarget(insertionEditor.state.selection);
+        const trackInsertion: Parameters<typeof insertionEditor.on<"transaction">>[1] = ({ transaction }) => {
+          insertionTarget = mapResourceInsertionTarget(insertionTarget, transaction.mapping);
+        };
+        insertionEditor.on("transaction", trackInsertion);
+        stopTrackingInsertion = () => insertionEditor.off("transaction", trackInsertion);
         setImageUploadState("uploading");
-        const imageReadiness: Promise<void>[] = [];
 
         const results = await processFileUploadBatch(files, async (file) => {
           const isImage = SUPPORTED_PASTE_IMAGE_TYPES.has(resolveResourceUploadMimeType(file.name, file.type));
@@ -1159,9 +1189,6 @@ const RichEditorPane = ({
           if (placeholder) updateImageUploadPlaceholder(editorRef.current, placeholder,
             t("editor.uploadState.uploading"));
           const resource = await uploadEditorResource(targetMemoId, uploadFile, isImage);
-          if (resource.kind === "image") {
-            imageReadiness.push(waitForImageSourceReady(resource.url));
-          }
           return resource;
         });
 
@@ -1169,7 +1196,6 @@ const RichEditorPane = ({
         if (successfulResults.length > 0) {
           void queryClient.invalidateQueries({ queryKey: ["resources"] });
         }
-        await Promise.all(imageReadiness);
 
         const activeEditor = editorRef.current;
         const activeMemoId = resolveTargetMemoId();
@@ -1180,6 +1206,7 @@ const RichEditorPane = ({
         const content = successfulResults.map(({ file, value: resource }) => {
           const filename = resource.filename || file.name;
           if (resource.kind === "image") {
+            registerImageUploadPreview(activeEditor, resource.url, file);
             return {
               type: "image",
               attrs: {
@@ -1275,11 +1302,13 @@ const RichEditorPane = ({
         console.error("[editor] Attachment insertion failed", error);
         setImageUploadState("error");
       } finally {
+        stopTrackingInsertion?.();
         resumeDesktopSync?.();
         const placeholderEditor = editorRef.current;
         placeholders.forEach((placeholder) => {
           removeImageUploadPlaceholder(placeholderEditor, placeholder);
         });
+        if (isEditorReady(placeholderEditor)) pruneImageUploadPreviews(placeholderEditor, placeholderEditor.state.doc);
       }
     });
     return true;
@@ -1464,23 +1493,7 @@ const RichEditorPane = ({
         insertResourceFiles(files);
         return true;
       },
-      handleDrop: (view, event) => {
-        if (!shouldInsertDroppedResourceFiles({
-          dataTransfer: event.dataTransfer,
-          isInternalNodeDrag: Boolean(view.dragging),
-        })) {
-          return false;
-        }
-
-        event.preventDefault();
-        // Use the same coordinate lookup as ProseMirror's external drop cursor.
-        // A drop inserts at a point; it must never replace the old text selection.
-        const dropPosition = view.posAtCoords({ left: event.clientX, top: event.clientY });
-        if (dropPosition) {
-          insertResourceFiles(getResourceFilesFromDataTransfer(event.dataTransfer), dropPosition.pos);
-        }
-        return true;
-      },
+      handleDrop: (view, event) => handleResourceFileDrop(view, event, insertResourceFiles),
     },
   }, [
     // Keep one TipTap view for the pane lifetime. A newly created memo already
@@ -2254,7 +2267,8 @@ const RichEditorPane = ({
         from: selection.from,
         to: selection.to,
         isInline: true,
-        documentFingerprint: "",
+        // The whole source, so a later replace can tell that the document moved under the selection.
+        documentFingerprint: sourceEditor.sliceText(0, sourceEditor.getDocumentLength()),
         mode: "markdown",
       };
     } else if (isEditorReady(editor)) {
@@ -2313,6 +2327,97 @@ const RichEditorPane = ({
     setSelectionPin(null);
     return true;
   }, [markDirty, setMarkdownSource]);
+
+  /**
+   * What the AI sidebar may do with a body draft (#652 PR B). A selection target applies only
+   * while the text at it is unchanged; the sidebar asks the user before using a new target.
+   */
+  const aiDraftEditor = useMemo<AiDraftEditorApi | null>(() => {
+    if (effectiveReadOnly || useMobilePlainTextEditor) return null;
+    const richSnapshotIsCurrent = (snapshot: AiDraftSelectionSnapshot) => {
+      const currentEditor = editorRef.current;
+      if (!isEditorReady(currentEditor)) return false;
+      const size = currentEditor.state.doc.content.size;
+      return snapshot.from >= 0 && snapshot.to > snapshot.from && snapshot.to <= size
+        && hashAiDraftSource(getAiDocumentFingerprint(currentEditor.state.doc.toJSON())) === snapshot.documentHash;
+    };
+    const applyAtSelection = (snapshot: AiDraftSelectionSnapshot, markdown: string, placement: "replace" | "after") => {
+      const currentMemo = memoRef.current;
+      const body = markdown.trim();
+      if (!currentMemo || !body) return false;
+      if (snapshot.mode === "markdown") {
+        const sourceEditor = markdownSourceEditorRef.current;
+        if (!useMarkdownSourceEditor || !sourceEditor) return false;
+        if (sourceEditor.sliceText(snapshot.from, snapshot.to) !== snapshot.text) return false;
+        // The same text can move to the old offsets after other edits; any change asks again.
+        if (hashAiDraftSource(sourceEditor.sliceText(0, sourceEditor.getDocumentLength())) !== snapshot.documentHash) return false;
+        const insertion = placement === "replace" ? body : `${snapshot.text.includes("\n") ? "\n\n" : " "}${body}`;
+        const [from, to] = placement === "replace" ? [snapshot.from, snapshot.to] : [snapshot.to, snapshot.to];
+        const next = `${sourceEditor.sliceText(0, from)}${insertion}${sourceEditor.sliceText(to, sourceEditor.getDocumentLength())}`;
+        sourceEditor.insertText(insertion, from, to);
+        setMarkdownSource(next);
+        markDirty();
+        return true;
+      }
+      const currentEditor = editorRef.current;
+      if (useMarkdownSourceEditor || !isEditorReady(currentEditor) || !richSnapshotIsCurrent(snapshot)) return false;
+      const content = getRichTextAiSelectionReplacement(placement === "after" && snapshot.isInline ? ` ${body}` : body, snapshot.isInline);
+      const range = placement === "replace" ? { from: snapshot.from, to: snapshot.to } : snapshot.to;
+      return currentEditor.chain().focus().insertContentAt(range, content).run();
+    };
+    return {
+      noteMarkdown: () => getCurrentMarkdownForAi(),
+      replaceNote: (markdown) => {
+        const currentEditor = editorRef.current;
+        if (useMarkdownSourceEditor) setMarkdownSource(markdown);
+        else if (isEditorReady(currentEditor)) currentEditor.commands.setContent(markdownToDoc(markdown));
+        else return false;
+        markDirty();
+        return true;
+      },
+      appendToNote: (markdown) => {
+        const body = markdown.trim();
+        if (!body) return false;
+        const currentEditor = editorRef.current;
+        if (useMarkdownSourceEditor) {
+          setMarkdownSource((current) => `${current.trimEnd()}${current.trim() ? "\n\n" : ""}${body}\n`);
+        } else if (isEditorReady(currentEditor)) {
+          currentEditor.chain().focus().insertContentAt(currentEditor.state.doc.content.size, getRichTextAiSelectionReplacement(body, false)).run();
+        } else {
+          return false;
+        }
+        markDirty();
+        return true;
+      },
+      replaceSelection: (snapshot, markdown) => applyAtSelection(snapshot, markdown, "replace"),
+      insertAfterSelection: (snapshot, markdown) => applyAtSelection(snapshot, markdown, "after"),
+      currentSelection: () => {
+        if (useMarkdownSourceEditor) {
+          const sourceEditor = markdownSourceEditorRef.current;
+          if (!sourceEditor) return null;
+          const selection = sourceEditor.getSelection();
+          const text = sourceEditor.sliceText(selection.from, selection.to);
+          if (!text.trim() || selection.to <= selection.from) return null;
+          return {
+            text, from: selection.from, to: selection.to, isInline: true, mode: "markdown",
+            documentHash: hashAiDraftSource(sourceEditor.sliceText(0, sourceEditor.getDocumentLength())),
+          };
+        }
+        const currentEditor = editorRef.current;
+        if (!isEditorReady(currentEditor)) return null;
+        const context = getRichTextAiSelectionContext(currentEditor.state.doc, currentEditor.state.selection);
+        if (!context?.contentMarkdown.trim()) return null;
+        return {
+          text: context.contentMarkdown,
+          from: context.from,
+          to: context.to,
+          isInline: context.isInline,
+          mode: "rich",
+          documentHash: hashAiDraftSource(getAiDocumentFingerprint(currentEditor.state.doc.toJSON())),
+        };
+      },
+    };
+  }, [effectiveReadOnly, getCurrentMarkdownForAi, markDirty, setMarkdownSource, useMarkdownSourceEditor, useMobilePlainTextEditor]);
 
   const syncMarkdownAiMenu = useCallback(() => {
     if (!useMarkdownSourceEditor || effectiveReadOnly || useMobilePlainTextEditor || !readAiSelectionMenuPreference()) {
@@ -2965,6 +3070,7 @@ const RichEditorPane = ({
     setShareOpen,
     shareOpen,
     wechatCopyState,
+    wechatCopyError,
   } = useEditorDocumentActions({
     canShareMemo: Boolean(memo && !readOnly),
     documentActionRequest,
@@ -2975,7 +3081,7 @@ const RichEditorPane = ({
     markdownSource,
     memo,
     noteProse,
-    notebookName: notebookOptions.find((notebook) => notebook.id === memo?.notebookId)?.name ?? "",
+    notebookName: notebookName ?? "",
     onDocumentActionConsumed,
     onSaveAsTemplate,
     tagsText,
@@ -4274,11 +4380,91 @@ const RichEditorPane = ({
             </div>
             <MemoEditorToolbarDivider className="mx-0.5 hidden h-4 sm:block" />
             <div className="flex items-center gap-0.5">
+            {!readOnly && !useMarkdownSourceEditor && !useMobilePlainTextEditor && (
+              <DropdownMenu>
+                <IconTooltip label={t("editor.readingStyle")}>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      className={cn(
+                        "h-8 w-8 text-slate-500",
+                        (showMagazineCover || showChapterNavigation) && "bg-slate-100 text-slate-700 ring-1 ring-inset ring-slate-300 hover:bg-slate-200",
+                      )}
+                      size="icon"
+                      variant="ghost"
+                      type="button"
+                      aria-label={t("editor.readingStyle")}
+                    >
+                      <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="1.85"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        className="h-4 w-4"
+                        aria-hidden="true"
+                      >
+                        <rect
+                          x="3"
+                          y="3"
+                          width="18"
+                          height="9.5"
+                          rx="2"
+                          fill={showMagazineCover ? "currentColor" : "none"}
+                          fillOpacity={showMagazineCover ? "0.16" : undefined}
+                        />
+                        <path d="M7 7.75h6" />
+                        <rect
+                          x="3"
+                          y="15.5"
+                          width="7.5"
+                          height="5.5"
+                          rx="1.5"
+                          fill={showChapterNavigation ? "currentColor" : "none"}
+                          fillOpacity={showChapterNavigation ? "0.16" : undefined}
+                        />
+                        <rect
+                          x="13.5"
+                          y="15.5"
+                          width="7.5"
+                          height="5.5"
+                          rx="1.5"
+                          fill={showChapterNavigation ? "currentColor" : "none"}
+                          fillOpacity={showChapterNavigation ? "0.16" : undefined}
+                        />
+                      </svg>
+                    </Button>
+                  </DropdownMenuTrigger>
+                </IconTooltip>
+                <DropdownMenuContent align="end" className="min-w-36">
+                  <DropdownMenuCheckboxItem
+                    checked={showMagazineCover}
+                    onSelect={(event) => event.preventDefault()}
+                    onCheckedChange={(checked) => {
+                      const saved = updateMemoReadingStyle(localDataScope, memo.id, { showMagazineCover: checked });
+                      setReadingStyleSaveError(saved ? null : memo.id);
+                    }}
+                  >
+                    {t("editor.magazineCover")}
+                  </DropdownMenuCheckboxItem>
+                  <DropdownMenuCheckboxItem
+                    checked={showChapterNavigation}
+                    onSelect={(event) => event.preventDefault()}
+                    onCheckedChange={(checked) => {
+                      const saved = updateMemoReadingStyle(localDataScope, memo.id, { showChapterNavigation: checked });
+                      setReadingStyleSaveError(saved ? null : memo.id);
+                    }}
+                  >
+                    {t("editor.chapterNavigation")}
+                  </DropdownMenuCheckboxItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
             <MemoEditorFocusModeButton
               desktopFocusMode={desktopFocusMode}
               onToggleDesktopFocusMode={onToggleDesktopFocusMode}
             />
-            {!readOnly && (!mobileEditingActive || isMemoShared) && (
+            {!readOnly && editorColumnWidth >= 960 && (!mobileEditingActive || isMemoShared) && (
               <IconTooltip label={t(isLocalMemoId(memo.id) ? "sharing.afterSync" : isMemoShared ? "sharing.manage" : "sharing.action")}>
                 <Button
                   className="h-8 w-8 text-slate-500"
@@ -4363,22 +4549,28 @@ const RichEditorPane = ({
                       {phonePreviewOpen ? t("editor.hidePhonePreview") : t("editor.showPhonePreview")}
                     </DropdownMenuItem>
                   )}
-                  <DropdownMenuItem
-                    className="flex h-9 w-full items-center gap-2 px-3 text-left text-xs text-slate-700 hover:bg-slate-50 cursor-pointer outline-none"
-                    disabled={!editor || useMobilePlainTextEditor || wechatCopyState === "copying"}
-                    onClick={() => void handleCopyToWeChat()}
+                  <IconTooltip
+                    side="left"
+                    contentClassName="z-[110] max-w-xs whitespace-normal"
+                    label={t("editor.copyToWeChatTooltip")}
                   >
-                    {wechatCopyState === "copying" ? (
-                      <LoaderCircle className="h-4 w-4 animate-spin text-slate-500" />
-                    ) : wechatCopyState === "copied" ? (
-                      <Check className="h-4 w-4 text-slate-500" />
-                    ) : wechatCopyState === "error" ? (
-                      <CircleAlert className="h-4 w-4 text-rose-600" />
-                    ) : (
-                      <WeChatIcon className="h-4 w-4 text-slate-500" />
-                    )}
-                    {t(wechatCopyState === "copying" ? "editor.copyingToWeChat" : wechatCopyState === "copied" ? "editor.copiedToWeChat" : wechatCopyState === "error" ? "editor.copyToWeChatFailed" : "editor.copyToWeChat")}
-                  </DropdownMenuItem>
+                    <DropdownMenuItem
+                      className="flex h-9 w-full items-center gap-2 px-3 text-left text-xs text-slate-700 hover:bg-slate-50 cursor-pointer outline-none"
+                      disabled={!editor || useMobilePlainTextEditor || wechatCopyState === "copying"}
+                      onClick={() => void handleCopyToWeChat()}
+                    >
+                      {wechatCopyState === "copying" ? (
+                        <LoaderCircle className="h-4 w-4 animate-spin text-slate-500" />
+                      ) : wechatCopyState === "copied" ? (
+                        <Check className="h-4 w-4 text-slate-500" />
+                      ) : wechatCopyState === "error" ? (
+                        <CircleAlert className="h-4 w-4 text-rose-600" />
+                      ) : (
+                        <ClipboardType className="h-4 w-4 text-slate-500" />
+                      )}
+                      {t(wechatCopyState === "copying" ? "editor.copyingToWeChat" : wechatCopyState === "copied" ? "editor.copiedToWeChat" : wechatCopyState === "error" ? "editor.copyToWeChatFailed" : "editor.copyToWeChat")}
+                    </DropdownMenuItem>
+                  </IconTooltip>
                 </>
               )}
               moreMenuItems={(
@@ -4556,6 +4748,11 @@ const RichEditorPane = ({
             onPickMathFormula={() => openMathFormula()}
           />
         )}
+        {readingStyleSaveError === memo.id && (
+          <p role="alert" className="px-4 py-2 text-xs text-rose-700 dark:text-rose-300">
+            {t("editor.readingStyleSaveFailed")}
+          </p>
+        )}
         <EditorSaveRecoveryBanner
           saveState={saveState}
           conflictReason={saveConflictReason}
@@ -4572,14 +4769,31 @@ const RichEditorPane = ({
       <div className="relative min-h-0 min-w-0 flex-1">
       <div
         ref={setEditorScrollContainerRef}
+        onDragOver={(event) => {
+          if (useMobilePlainTextEditor || useMarkdownSourceEditor || effectiveReadOnly ||
+            !isEditorReady(editor) || !editor.isEditable || editor.view.dragging ||
+            !Array.from(event.dataTransfer.types).includes("Files")) return;
+          event.preventDefault();
+          event.dataTransfer.dropEffect = "copy";
+        }}
+        onDrop={(event) => {
+          if (useMobilePlainTextEditor || useMarkdownSourceEditor || effectiveReadOnly ||
+            !isEditorReady(editor)) return;
+          // Bubble phase preserves node handlers; a handled drop is ignored by
+          // the shared helper so each file is inserted only once.
+          handleResourceFileDrop(editor.view, event.nativeEvent, insertResourceFiles);
+        }}
         data-editor-theme="default"
         data-note-palette={noteProse.palette}
         data-note-heading-style={noteProseStyle.headingStyle}
         data-note-quote-style={noteProseStyle.quoteStyle}
         data-note-emphasis-style={noteProseStyle.emphasisStyle}
-        data-note-magazine-cover={noteProseStyle.showMagazineCover ? "true" : "false"}
+        data-note-magazine-cover={showMagazineCover ? "true" : "false"}
+        data-note-chapter-navigation={showChapterNavigation ? "true" : "false"}
+        data-note-tags={JSON.stringify(parseTagsText(tagsText))}
         data-note-title={title || getEditableMemoTitle(memo?.title)}
         style={{
+          ...noteCoverTagCssVariables(parseTagsText(tagsText)),
           ...noteProseCssVariables(noteProse),
           ...noteProseStyleCssVariables(noteProseStyle),
           "--memo-content-divider-spacing": `${MEMO_CONTENT_STYLE.divider.marginVertical}px`,
@@ -4603,6 +4817,9 @@ const RichEditorPane = ({
             />
           ) : null}
         <div
+          onPointerDownCapture={() => { editorCanvasInteractionVersionRef.current += 1; }}
+          onKeyDownCapture={() => { editorCanvasInteractionVersionRef.current += 1; }}
+          onBeforeInputCapture={() => { editorCanvasInteractionVersionRef.current += 1; }}
           onClickCapture={
             !useMobilePlainTextEditor && !useMarkdownSourceEditor
               ? handleEditorClickCapture
@@ -4739,11 +4956,13 @@ const RichEditorPane = ({
                     onAsk={() => requestSelectionAi("ask")}
                   />
                 </BubbleMenu>
-                {noteProseStyle.showMagazineCover ? (
+                {showMagazineCover || showChapterNavigation ? (
                   <EditorMagazineHeader
                     editor={editor}
+                    showMagazineCover={showMagazineCover}
+                    showChapterNavigation={showChapterNavigation}
                     title={title || getEditableMemoTitle(memo?.title)}
-                    tags={memo?.tags}
+                    tags={parseTagsText(tagsText)}
                     updatedAt={memo?.updatedAt}
                     palette={noteProse.palette}
                   />
@@ -4757,12 +4976,17 @@ const RichEditorPane = ({
             )}
           </div>
           {!isMobileViewport && !useMobilePlainTextEditor && !useMarkdownSourceEditor && phonePreviewOpen && (
-            <EditorPhonePreview
-              editor={editor}
-              title={getEditableMemoTitle(memo?.title)}
-              scrollContainer={editorScrollContainer}
-              noteProse={noteProse}
-            />
+            <Suspense fallback={<DeferredToolLoading />}>
+              <EditorPhonePreview
+                editor={editor}
+                title={title || getEditableMemoTitle(memo?.title)}
+                tagsKey={tagsText}
+                showMagazineCover={showMagazineCover}
+                showChapterNavigation={showChapterNavigation}
+                scrollContainer={editorScrollContainer}
+                noteProse={noteProse}
+              />
+            </Suspense>
           )}
           {showDocumentOutline && memo && hydratedEditorMemoId === memo.id && (
             <EditorOutline
@@ -4870,7 +5094,7 @@ const RichEditorPane = ({
 
       {(wechatCopyState === "copied" || wechatCopyState === "error") && (
         <ClipboardCopyNotice status={wechatCopyState === "copied" ? "copied" : "error"}>
-          {t(wechatCopyState === "copied" ? "editor.copiedToWeChat" : "editor.copyToWeChatFailed")}
+          {wechatCopyState === "error" && wechatCopyError ? wechatCopyError : t(wechatCopyState === "copied" ? "editor.copiedToWeChatNotice" : "editor.copyToWeChatFailed")}
         </ClipboardCopyNotice>
       )}
 
@@ -4922,34 +5146,43 @@ const RichEditorPane = ({
       )}
 
       {historyOpen && (
-        <RevisionHistoryDialog
-          currentMarkdown={
-            useMobilePlainTextEditor
-              ? getMobilePlainTextValue()
-              : isEditorReady(editor)
-                ? docToMarkdown(editor.getJSON() as TiptapDoc)
-                : memo.contentMarkdown
-          }
-          memo={memo}
-          repository={repository}
-          onClose={() => setHistoryOpen(false)}
-          onRestored={async (restoredMemo) => {
-            await localDb.drafts.delete(restoredMemo.id);
-            setHasUnsavedChanges(false);
-            await onSaved(restoredMemo);
-            setHistoryOpen(false);
-          }}
-        />
+        <Suspense fallback={<DeferredToolLoading />}>
+          <RevisionHistoryDialog
+            currentMarkdown={
+              useMobilePlainTextEditor
+                ? getMobilePlainTextValue()
+                : isEditorReady(editor)
+                  ? docToMarkdown(editor.getJSON() as TiptapDoc)
+                  : memo.contentMarkdown
+            }
+            memo={memo}
+            repository={repository}
+            onClose={() => setHistoryOpen(false)}
+            onRestored={async (restoredMemo) => {
+              await localDb.drafts.delete(restoredMemo.id);
+              setHasUnsavedChanges(false);
+              await onSaved(restoredMemo);
+              setHistoryOpen(false);
+            }}
+          />
+        </Suspense>
       )}
 
-      <ShareMemoDialog memoId={memo.id} open={shareOpen} onOpenChange={setShareOpen} />
+      {imgBedFailureDialog}
+      {shareOpen && (
+        <Suspense fallback={<DeferredToolLoading />}>
+          <ShareMemoDialog memoId={memo.id} open={shareOpen} onOpenChange={setShareOpen} />
+        </Suspense>
+      )}
 
       {imageShareSource && (
-        <ShareNoteImageDialog
-          open={imageShareOpen}
-          source={imageShareSource}
-          onOpenChange={setImageShareOpen}
-        />
+        <Suspense fallback={<DeferredToolLoading />}>
+          <ShareNoteImageDialog
+            open={imageShareOpen}
+            source={imageShareSource}
+            onOpenChange={setImageShareOpen}
+          />
+        </Suspense>
       )}
       </div>
       <AiSidebarErrorBoundary open={aiAssistantOpen} onOpenChange={setAiSidebarOpen}>
@@ -4962,10 +5195,12 @@ const RichEditorPane = ({
           selectionRequest={selectionRequest}
           onDismissSelectionPin={() => setSelectionPin(null)}
           onReplaceSelection={replacePinnedSelection}
+          aiDraftEditor={aiDraftEditor}
+          localDataScope={localDataScope}
           contentMarkdown={currentMarkdownForAi}
           memoId={memo.id}
           notebookId={memo.notebookId}
-          notebookTitle={notebookOptions.find((notebook) => notebook.id === memo.notebookId)?.name}
+          notebookTitle={notebookName}
           noteTitle={title}
           beforeCompanionApply={beforeCompanionApply}
           onCompanionNotesChanged={onCompanionNotesChanged}

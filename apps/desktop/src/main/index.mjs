@@ -12,7 +12,7 @@ import { OffsiteBackup } from "./backup-offsite.mjs";
 import { createBackupWorkerFactory } from "./backup-worker.mjs";
 import { registerBackupIpc } from "./backup-ipc.mjs";
 import { SidecarRpcClient } from "./rpc.mjs";
-import { instanceOrigin, decodeSessionCredential, credentialForUrl, writeSessionCredential } from "./session-credential.mjs";
+import { instanceOrigin, decodeSessionCredential, credentialForUrl, writeSessionCredential, clearInstanceSessionCookie } from "./session-credential.mjs";
 import { resourceRequestHeaders } from "./resource-request.mjs";
 import { createResourceProtocolHandler } from "./resource-protocol.mjs";
 import { downloadContentDispositionFromRequest, isSafeResourceId, resourceIdFromRequest, resourceResponseHeaders } from "./resource-url.mjs";
@@ -37,7 +37,7 @@ import {
 } from "./installation-location.mjs";
 import { userDataDirectoryFromArguments } from "./user-data-directory.mjs";
 import { PRINT_PDF_OPTIONS } from "./print-pdf.mjs";
-import { isAllowedAppNavigation, isAllowedPrintPreviewUrl, isResourceDownloadUrl } from "./window-open-policy.mjs";
+import { createAppWindowOpenHandler, isAllowedAppNavigation, isAllowedPrintPreviewUrl, isResourceDownloadUrl } from "./window-open-policy.mjs";
 import { showWindow } from "./window-visibility.mjs";
 import { formatGlobalShortcutForHumans, globalShortcutAccelerator, globalShortcutAcceleratorsConflict, normalizeGlobalShortcutBinding, parseStoredGlobalShortcuts, replaceGlobalShortcut, toggleMainWindow } from "./global-shortcut.mjs";
 import { trayIconPath } from "./tray-icon.mjs";
@@ -69,7 +69,7 @@ import { createUpdateNetworkDiagnostics } from "./update-network-diagnostics.mjs
 import { normalizeUpdateProgress } from "./update-progress.mjs";
 import { inspectWindowsTaskbarShortcuts } from "./windows-taskbar-diagnostics.mjs";
 import { testPicGoConnection, createPicGoUploadQueue, uploadPicGoImage } from "./picgo.mjs";
-import { testImgBedConnection, uploadImgBedImage } from "./imgbed.mjs";
+import { listImgBedChannels, testImgBedConnection, uploadImgBedImage } from "./imgbed.mjs";
 import { createPluginPublicNetworkRuntime } from "./plugin-public-network.mjs";
 import { createAiDirectRuntime } from "./ai-direct.mjs";
 import { createAcpPathStore, validateTrustedAcpPath } from "./acp-path-store.mjs";
@@ -393,6 +393,7 @@ const desktopRuntimeSystemInfo = () => ({
   autoUpdateSupported: true,
   platform: process.platform,
   architecture: process.arch,
+  runningUnderRosetta: process.platform === "darwin" && process.arch === "x64" && app.runningUnderARM64Translation === true,
   deviceModel: desktopDeviceModel(),
   osVersion: process.getSystemVersion?.() || "unknown",
   osRelease: operatingSystemRelease(),
@@ -1025,6 +1026,7 @@ const createTray = () => {
 
 const handleResourceProtocolRequest = createResourceProtocolHandler({
   getDirectory: resourceCacheDirectory,
+  getIntegrity: resourceId => sidecar?.request("resource.integrity", { resourceId }),
   getApiBaseUrl: () => configuredApiBaseUrl,
   getRequestHeaders: async sourceUrl => {
     const sessionToken = credentialForUrl(desktopSessionToken, desktopSessionTokenOrigin, sourceUrl);
@@ -1475,23 +1477,11 @@ const createWindow = async ({ show = true } = {}) => {
   });
   mainWindow.webContents.on("will-redirect", guardNavigation);
 
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (isAllowedPrintPreviewUrl(url, mainWindow.webContents.getURL())) {
-      return {
-        action: "allow",
-        overrideBrowserWindowOptions: {
-          webPreferences: {
-            contextIsolation: true,
-            nodeIntegration: false,
-            sandbox: true,
-            preload: fileURLToPath(new URL("../preload/print.cjs", import.meta.url)),
-          },
-        },
-      };
-    }
-    if (url.startsWith("https://") || url.startsWith("http://")) void shell.openExternal(url);
-    return { action: "deny" };
-  });
+  mainWindow.webContents.setWindowOpenHandler(createAppWindowOpenHandler({
+    getAppUrl: () => mainWindow.webContents.getURL(),
+    printPreloadPath: fileURLToPath(new URL("../preload/print.cjs", import.meta.url)),
+    openExternal: (url) => shell.openExternal(url),
+  }));
 
   try {
     if (app.isPackaged && !process.env.EDGE_EVER_DESKTOP_WEB_URL) {
@@ -1539,10 +1529,11 @@ const createNoteWindow = (memoId) => {
   window.webContents.on("will-redirect", (event, url) => {
     if (!isAllowedAppNavigation(url, rendererEntryUrl)) event.preventDefault();
   });
-  window.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith("https://") || url.startsWith("http://")) void shell.openExternal(url);
-    return { action: "deny" };
-  });
+  window.webContents.setWindowOpenHandler(createAppWindowOpenHandler({
+    getAppUrl: () => window.webContents.getURL(),
+    printPreloadPath: fileURLToPath(new URL("../preload/print.cjs", import.meta.url)),
+    openExternal: (url) => shell.openExternal(url),
+  }));
   // A window that cannot show its note is closed so the note returns to the
   // main window; ERR_ABORTED (-3) only means a navigation was superseded.
   window.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
@@ -1831,6 +1822,7 @@ const startApplication = async () => {
     await noteWindows.closeAll();
     scheduledTaskScheduler.clear();
     await backupManager.setContext(null);
+    await clearInstanceSessionCookie(session.defaultSession.cookies, configuredApiBaseUrl);
     await saveDesktopSessionToken("");
     return { stored: false };
   });
@@ -1842,6 +1834,12 @@ const startApplication = async () => {
   ipcMain.handle("desktop:imgbed-test", (event, input) => {
     if (!isAppRendererSender(event)) throw new Error("ImgBed requests must come from the main window");
     return testImgBedConnection(input && typeof input === "object" ? input : {});
+  });
+  ipcMain.handle("desktop:imgbed-channels", (event, input) => {
+    if (!isAppRendererSender(event)) throw new Error("ImgBed requests must come from the main window");
+    const target = input && typeof input === "object" ? input : {};
+    // Only the address and token are needed; never forward other renderer fields.
+    return listImgBedChannels({ endpoint: target.endpoint, token: target.token });
   });
   // Serialize uploads and error dialogs across rapid pastes and multi-image batches,
   // shared by PicGo and ImgBed so one failure dialog is shown at a time.
@@ -2169,7 +2167,7 @@ const startApplication = async () => {
       await restrictDirectory(directory);
       assertCurrent();
       await writeAttachmentFile(join(directory, `${resource.id}.bin`), bytes);
-      await writeAttachmentFile(join(directory, `${resource.id}.json`), JSON.stringify({ contentType: resource.mimeType }));
+      await writeAttachmentFile(join(directory, `${resource.id}.json`), JSON.stringify({ contentType: resource.mimeType, byteSize: resource.byteSize, sha256: resource.sha256 }));
       assertCurrent();
       if (!currentSidecar) throw new Error("Sidecar unavailable");
       await currentSidecar.request("resource.cache", { resource });

@@ -4,6 +4,7 @@ import type { ImportIndex, ImportNotebook, ImportNote, ImportNoteResult, ImportR
 import { indexItems } from "../../../../../packages/shared/src/note-import/index-store";
 import { findImportReferences, rewriteImportMarkdown } from "../../../../../packages/shared/src/note-import/references";
 import { resourceLinkToMarkdown } from "../../../../../packages/shared/src/resource-links";
+import { escapeImportText } from "../../../../../packages/shared/src/note-import/metadata";
 
 export type ImportProgress = { phase: "folders" | "notes" | "resources" | "refresh"; path: string; completed: number; total: number; unit?: "bytes" };
 type ImportClient = Pick<ReturnType<typeof createEdgeEverClient>, "getImportCapabilities" | "listNotebooks" | "createNotebook" | "importMemos" | "uploadMemoResourceParts" | "getMemo" | "createMemoEditSession" | "updateMemo">;
@@ -28,7 +29,7 @@ export const executeNoteImport = async (input: {
   const total = await index.count("note");
   signal?.throwIfAborted();
   const capabilities = await client.getImportCapabilities();
-  if (capabilities.protocolVersion !== 1) throw new Error("unsupportedImportServer");
+  if (capabilities.protocolVersion !== 1 || !capabilities.formats.includes(reader.format)) throw new Error("unsupportedImportServer");
   if (input.parentId && !(await client.listNotebooks()).notebooks.some(nb => nb.id === input.parentId)) throw new Error("missingParent");
   const createdParent = await index.get<{ id: string | null }>("folderResult", "__destination");
   if (createdParent && createdParent.id !== (input.parentId ?? null)) throw new Error("destinationChanged");
@@ -58,7 +59,7 @@ export const executeNoteImport = async (input: {
   try {
     release = await input.pauseSync?.();
     for await (const folder of indexItems<ImportNotebook>(index, "notebook")) {
-      onProgress?.({ phase: "folders", path: folder.key, completed: foldersDone, total: folders });
+      onProgress?.({ phase: "folders", path: folder.key || folder.name, completed: foldersDone, total: folders });
       await ensureFolder(folder.key); foldersDone++;
     }
     for await (const descriptor of indexItems<ImportNote>(index, "note")) {
@@ -80,6 +81,10 @@ export const executeNoteImport = async (input: {
           for (const resource of note.resources) if (!original.includes(`evernote-resource:${resource.hash}`)) {
             original += `\n\n${resourceLinkToMarkdown(resource.filename.replace(/[\r\n]+/g, " "), `evernote-resource:${resource.hash}`)}`;
           }
+          for (const resource of note.skippedResources ?? []) {
+            original += `\n\n${escapeImportText(`[Attachment not imported: ${resource.filename} (${resource.hash}, ${resource.byteSize} bytes)]`)}`;
+          }
+          if (note.originalTitle) original = `# ${escapeImportText(note.originalTitle)}\n\n${original}`;
         }
         onProgress?.({ phase: "notes", path: note.path, completed: result.completed, total });
         signal?.throwIfAborted();
